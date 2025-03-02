@@ -1,0 +1,8 @@
+_target_: fusion_bench.method.FrankWolfeAlgorithm
+init_weight: outputs/logs/ViT-B-32/adamerging_TA8/version_2/outputs/clip-vit-base-patch32_TA8_task_wise_adamerging_weights.pt
+merge_fn: task_arithmetic
+max_iters: 10
+step_size: 0.1
+dataset_size: 100
+tasks: []
+scaling_factor: 0.3

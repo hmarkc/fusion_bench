@@ -1,0 +1,7 @@
+_target_: fusion_bench.method.FrankWolfeAdamergingAlgorithm
+init_weight:
+max_iters: 10
+tasks:
+ada_iters: 500
+init_value: 0.0
+dataset_size: 100

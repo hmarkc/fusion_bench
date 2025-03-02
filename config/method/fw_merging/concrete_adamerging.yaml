@@ -1,0 +1,5 @@
+_target_: fusion_bench.method.FrankWolfeAlgorithm
+merge_fn: concrete_ta
+max_iters: 10
+step_size: 0.1
+dataset_size: 100

@@ -1,0 +1,10 @@
+_target_: fusion_bench.method.FrankWolfeAdamergingAlgorithm
+init_weight:
+max_iters: 10
+merge_fn: 'adamerging'
+tasks:
+ada_iters: 500
+dataset_size: 100
+ada_coeff: 1e-8
+step_size: 0.1
+max_num_models: 100
