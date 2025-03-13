@@ -179,6 +179,7 @@ class FrankWolfeAlgorithm(
                  max_iters: int,
                  dataset_size:int,
                  tasks: List[str] = [],
+                 granularity: str = 'task',
                  max_num_models: int = 100,
                  loss_fn: str = "cross_entropy",
                  init_weight: str = "",
@@ -207,6 +208,7 @@ class FrankWolfeAlgorithm(
         self.init_weight = init_weight
         self.step_size = step_size
         self.max_iters = max_iters
+        self.granularity = granularity
         self.loss_fn = loss_fn
         self.tasks = tasks
         self.dataset_size = dataset_size
@@ -280,6 +282,58 @@ class FrankWolfeAlgorithm(
         
         return gradients
 
+
+    def frank_wolfe_selection(self, gradients, checkpoints, model_to_merge_names=[], type='task'):
+        assert type in ['task', 'layer'], f"Unsupported FW selection type: {type}, supported types are ['task', 'layer']"
+        min_inner_product = float("inf")
+        min_model = None 
+        min_model_name = None
+        log_dict = {}
+        if type == 'task':
+            for model_name, model_to_merge in checkpoints.items():
+                model_to_merge = model_to_merge.to('cpu').state_dict()
+                inner_product_sum = 0
+                for param_name, param_value in model_to_merge.items():
+                    # caclulate consine similarity
+                    grad = gradients[param_name]
+                    ckpt = model_to_merge[param_name]
+                    param_alignment = torch.dot(grad.flatten(), ckpt.flatten()) / (torch.norm(grad) * torch.norm(ckpt))
+                    inner_product_sum += param_alignment
+                log_dict[model_name] = inner_product_sum.item()
+                if inner_product_sum < min_inner_product and model_name not in model_to_merge_names:
+                    min_inner_product = inner_product_sum
+                    min_model = deepcopy(model_to_merge)
+                    min_model_name = model_name
+        else:
+            min_model = {}
+            min_inner_product = {}
+            min_idx = {}
+            min_model_name = {}
+            for model_name, model_to_merge in checkpoints.items():
+                model_to_merge = model_to_merge.to('cpu').state_dict()
+                for param_name, param_value in model_to_merge.items():
+                    # caclulate consine similarity
+                    grad = gradients[param_name]
+                    ckpt = model_to_merge[param_name]
+                    param_alignment = torch.dot(grad.flatten(), ckpt.flatten()) / (torch.norm(grad) * torch.norm(ckpt))
+                    if (param_name not in min_inner_product or param_alignment < min_inner_product[param_name]) and \
+                            model_name not in model_to_merge_names[param_name]:
+                        min_inner_product[param_name] = param_alignment
+                        # if min_inner_product[param_name] < 0:
+                        min_model[param_name] = param_value
+                        min_idx[param_name] = model_name
+                        min_model_name[param_name] = model_name
+                        # else:
+                            # min_model[param_name] = torch.zeros_like(param_value)
+            min_inner_product = sum(min_inner_product.values())
+            log_dict = {model_name: 0 for model_name in checkpoints.keys()}
+            for k in min_idx.values():
+                log_dict[k] += 1 
+        
+        return min_model, min_model_name, min_inner_product, log_dict
+
+
+
     def run(self, modelpool: HuggingFaceClipVisionPool):
         log.info("Fusing models using FW merging.")
         self.modelpool = modelpool
@@ -331,44 +385,23 @@ class FrankWolfeAlgorithm(
                 dynamic_ncols=True,
             )
         ):
-            torch.set_grad_enabled(True)
             torch.cuda.empty_cache()
+            torch.set_grad_enabled(True)
             gradients = self.frank_wolfe_iteration(merged_model.cuda())
-            grad_norm = torch.norm(torch.stack([torch.norm(g) for g in gradients.values()]))
-
             torch.set_grad_enabled(False)
-            # Find the task vector with the most alignment to the gradient
-            model_to_merge_dict = {}
-            min_alignment = {}
-            min_idx = {}
-            for model_name, model_to_merge in finetuned_models.items():
-                model_to_merge = model_to_merge.to('cpu').state_dict()
-                for param_name, param_value in model_to_merge.items():
-                    # caclulate consine similarity
-                    grad = gradients[param_name]
-                    ckpt = model_to_merge[param_name]
-                    param_alignment = torch.dot(grad.flatten(), ckpt.flatten()) / (torch.norm(grad) * torch.norm(ckpt))
-                    if param_name not in min_alignment or param_alignment < min_alignment[param_name]:
-                        min_alignment[param_name] = param_alignment
-                        if min_alignment[param_name] < 0:
-                            model_to_merge_dict[param_name] = param_value
-                            min_idx[param_name] = model_name
-                        else:
-                            model_to_merge_dict[param_name] = torch.zeros_like(param_value)
-                            # model_to_merge_dict[param_name] = merged_model.state_dict()[param_name].to('cpu')
-            chosen_model = {model_name: 0 for model_name in finetuned_models.keys()}
-            for k in min_idx.values():
-                chosen_model[k] += 1
+            grad_norm = torch.norm(torch.stack([torch.norm(g) for g in gradients.values()]))
+            
+            min_model, min_model_name, min_alignment, chosen_model = self.frank_wolfe_selection(gradients, finetuned_models, type=self.granularity)
 
             # Determine step size
             step = 2 / (step_idx + 2) * self.step_size
             
             # print iteration information
-            log.info(f"Iteration {step_idx+1}, Task Vector: {chosen_model}, Gradient Norm: {grad_norm:.6f}, Step Size: {step:.6f}, Negative Alignment: {sum([1 for v in min_alignment.values() if v < 0])}/{len(min_alignment)}")
+            log.info(f"Iteration {step_idx+1}, Task Vector: {min_model_name}, Gradient Norm: {grad_norm:.6f}, Inner Products: {min_alignment:.6f}, Chosen Model: {chosen_model}")
             
             merged_model = self.merge_fn(
                     pretrained_model=merged_model.to('cpu'),
-                    finetuned_models=[model_to_merge_dict],
+                    finetuned_models=[min_model],
                     scaling_factor=step*self.scaling_factor,
                 )
     

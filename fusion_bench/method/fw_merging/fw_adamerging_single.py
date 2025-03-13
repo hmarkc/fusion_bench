@@ -80,7 +80,7 @@ def entropy_loss(logits: Tensor, pred = None, eps: float = 1e-8) -> Tensor:
     return -torch.sum(probs * torch.log(probs + eps), dim=-1).mean()
 
 
-class FrankWolfeAdamergingAlgorithm(
+class FrankWolfeSoftAlgorithm(
     CLIPClassificationMixin,
     ModelFusionAlgorithm,
     SimpleProfilerMixin,

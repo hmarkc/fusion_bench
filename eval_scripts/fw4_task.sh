@@ -57,6 +57,24 @@ export CUDA_VISIBLE_DEVICES=7
 # done   
 
 
+fusion_bench \
+    method=fw_merging/task_arithmetic \
+        method.max_iters=3 \
+        method.step_size=0.01 \
+        method.init_weight=base \
+        method.granularity=task \
+    method.tasks=[sun397,stanford-cars,gtsrb,dtd] \
+    modelpool=CLIPVisionModelPool/clip-vit-base-patch32_TALL20.yaml \
+    taskpool=CLIPVisionModelTaskPool/clip-vit-classification_TA4 
+
+fusion_bench \
+    method=fw_merging/adamerging \
+        method.max_iters=5 method.step_size=0.1 \
+        method.init_weight=base method.merge_fn=task method.granularity=task \
+    method.tasks=[gtsrb,sun397,stanford-cars,dtd] \
+    modelpool=CLIPVisionModelPool/clip-vit-base-patch32_TALL20 \
+    taskpool=CLIPVisionModelTaskPool/clip-vit-classification_TA4 
+
 for i in 4 6 8 10 12 14 16 18 20
 do
 for j in 0.1 0.05 0.01 0.005 0.001

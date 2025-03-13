@@ -130,7 +130,7 @@ def entropy_loss(logits: Tensor, pred = None, eps: float = 1e-8) -> Tensor:
     return -torch.sum(probs * torch.log(probs + eps), dim=-1).mean()
 
 
-class FrankWolfeAdamergingAlgorithm(
+class FrankWolfeSoftAlgorithm(
     CLIPClassificationMixin,
     ModelFusionAlgorithm,
     SimpleProfilerMixin,
@@ -141,6 +141,7 @@ class FrankWolfeAdamergingAlgorithm(
                  ada_iters: int,
                  ada_coeff: float,
                  merge_fn: str,
+                 granularity: str = "task",
                  max_num_models: int = 100,
                  step_size: float = 0.3,
                  tasks: List[str] = [],
@@ -158,6 +159,7 @@ class FrankWolfeAdamergingAlgorithm(
         self.max_iters = max_iters
         self.ada_iters = ada_iters
         self.ada_coeff = ada_coeff
+        self.granularity = granularity
         self.tasks = tasks
         self.step_size = step_size
         self.dataset_size = dataset_size
@@ -169,7 +171,7 @@ class FrankWolfeAdamergingAlgorithm(
         self.setup_zero_shot_classification_head()
     
     @functools.cache
-    def get_shuffled_loader_iter(self, task: str, batch_size: int = 1):
+    def get_shuffled_train_loader_iter(self, task: str, batch_size: int = 1):
         # get dataloader kwargs
         dataloader_kwargs = self._dataloader_kwargs.copy()
         dataloader_kwargs["shuffle"] = True
@@ -194,6 +196,8 @@ class FrankWolfeAdamergingAlgorithm(
     
     
     def run_adamerging(self, module: TaskWiseMergedModel):
+        entropy_loss = False
+        
         optimizer = torch.optim.Adam(
             [module.merge_weight], lr=1e-3
         )
@@ -213,14 +217,22 @@ class FrankWolfeAdamergingAlgorithm(
             metrics = {}
             total_loss = None
             tasks = self.modelpool.model_names if self.tasks == [] else self.tasks
+            if not entropy_loss:
+                loss_fn = nn.CrossEntropyLoss()
             for task in tasks:
                 with self.profile("data loading"):
-                    batch = next(self.get_shuffled_test_loader_iter(task, batch_size=16))
-                    # NOTE: The labels are not allowed to be used during test-time adaptation
+                    if entropy_loss:
+                        batch = next(self.get_shuffled_test_loader_iter(task, batch_size=16))
+                    else:
+                        batch = next(self.get_shuffled_train_loader_iter(task, batch_size=16))
+                        # NOTE: The labels are not allowed to be used during test-time adaptation
                     images = batch[0]
                 with self.profile("forward pass"):
                     logits = self.compute_logits(module, images, task)
-                    loss = entropy_loss(logits)
+                    if entropy_loss:
+                        loss = entropy_loss(logits)
+                    else:
+                        loss = loss_fn(logits, batch[1])
                     total_loss = loss if total_loss is None else total_loss + loss
 
             optimizer.zero_grad()
@@ -253,7 +265,7 @@ class FrankWolfeAdamergingAlgorithm(
         log.info(f"Processing task {task}")
         for _ in range(self.dataset_size):
             with self.profile("data loading"):
-                batch = next(self.get_shuffled_loader_iter(task))
+                batch = next(self.get_shuffled_train_loader_iter(task))
             with self.profile("forward pass"):
                 logits = self.compute_logits(merged_model, batch[0], task)
                 loss = loss_fn(logits, batch[1]) / (self.dataset_size * len(self.modelpool.model_names))
@@ -273,6 +285,58 @@ class FrankWolfeAdamergingAlgorithm(
         merged_model.eval()
         
         return gradients
+
+
+    def frank_wolfe_selection(self, gradients, checkpoints, model_to_merge_names=[], type='task'):
+        assert type in ['task', 'layer'], f"Unsupported FW selection type: {type}, supported types are ['task', 'layer']"
+        min_inner_product = float("inf")
+        min_model = None 
+        min_model_name = None
+        log_dict = {}
+        if type == 'task':
+            for model_name, model_to_merge in checkpoints.items():
+                model_to_merge = model_to_merge.to('cpu').state_dict()
+                inner_product_sum = 0
+                for param_name, param_value in model_to_merge.items():
+                    # caclulate consine similarity
+                    grad = gradients[param_name]
+                    ckpt = model_to_merge[param_name]
+                    param_alignment = torch.dot(grad.flatten(), ckpt.flatten()) / (torch.norm(grad) * torch.norm(ckpt))
+                    inner_product_sum += param_alignment
+                log_dict[model_name] = inner_product_sum.item()
+                if inner_product_sum < min_inner_product and model_name not in model_to_merge_names:
+                    min_inner_product = inner_product_sum
+                    min_model = deepcopy(model_to_merge)
+                    min_model_name = model_name
+        else:
+            min_model = {}
+            min_inner_product = {}
+            min_idx = {}
+            min_model_name = {}
+            for model_name, model_to_merge in checkpoints.items():
+                model_to_merge = model_to_merge.to('cpu').state_dict()
+                for param_name, param_value in model_to_merge.items():
+                    # caclulate consine similarity
+                    grad = gradients[param_name]
+                    ckpt = model_to_merge[param_name]
+                    param_alignment = torch.dot(grad.flatten(), ckpt.flatten()) / (torch.norm(grad) * torch.norm(ckpt))
+                    if (param_name not in min_inner_product or param_alignment < min_inner_product[param_name]) and \
+                            model_name not in model_to_merge_names[param_name]:
+                        min_inner_product[param_name] = param_alignment
+                        # if min_inner_product[param_name] < 0:
+                        min_model[param_name] = param_value
+                        min_idx[param_name] = model_name
+                        min_model_name[param_name] = model_name
+                        # else:
+                            # min_model[param_name] = torch.zeros_like(param_value)
+            min_inner_product = sum(min_inner_product.values())
+            log_dict = {model_name: 0 for model_name in checkpoints.keys()}
+            for k in min_idx.values():
+                log_dict[k] += 1 
+        
+        return min_model, min_model_name, min_inner_product, log_dict
+    
+
 
     def run(self, modelpool: HuggingFaceClipVisionPool):
         log.info("Fusing models using FW merging.")
@@ -316,47 +380,35 @@ class FrankWolfeAdamergingAlgorithm(
                 dynamic_ncols=True,
             )
         ):
-
             # Find the task vector with the most alignment to the gradient
             models_dict_to_merge = []
-            model_to_merge_names = []
+            model_to_merge_names = [] if self.granularity == 'task' else {name: [] for name in merged_model.state_dict().keys()}
+            inner_products = []
             tasks = self.tasks if self.tasks else self.modelpool.model_names
             for task in tasks:
                 torch.set_grad_enabled(True)
                 torch.cuda.empty_cache()
                 gradients = self.frank_wolfe_iteration(merged_model.cuda(), task)
-                grad_norm = torch.norm(torch.stack([torch.norm(g) for g in gradients.values()]))
-
                 torch.set_grad_enabled(False)
-                min_inner_product = float("inf")
-                min_model = None 
-                min_model_name = None
-                for model_name, model_to_merge in finetuned_models.items():
-                    model_to_merge = model_to_merge.to('cpu').state_dict()
-                    inner_product_sum = 0
-                    for param_name, param_value in model_to_merge.items():
-                        # caclulate consine similarity
-                        grad = gradients[param_name]
-                        ckpt = model_to_merge[param_name]
-                        param_alignment = torch.dot(grad.flatten(), ckpt.flatten()) / (torch.norm(grad) * torch.norm(ckpt))
-                        inner_product_sum += param_alignment
-                    if inner_product_sum < min_inner_product and model_name not in model_to_merge_names:
-                        min_inner_product = inner_product_sum
-                        min_model = deepcopy(model_to_merge)
-                        min_model_name = model_name
-                # if min_model is None:
-                #     # fill with zero parameters
-                #     min_model = {name: torch.zeros_like(param) for name, param in model_to_merge.items()}
-                #     min_model_name = 'zero'
-                models_dict_to_merge.append(min_model)
-                model_to_merge_names.append(min_model_name)
+                grad_norm = torch.norm(torch.stack([torch.norm(g) for g in gradients.values()]))
                 
+                min_model, min_model_name, min_inner_product, log_dict = self.frank_wolfe_selection(gradients, finetuned_models, model_to_merge_names, type=self.granularity)
+                if self.granularity == 'task':
+                    model_to_merge_names.append(min_model_name)
+                else:
+                    for k, v in min_model_name.items():
+                        model_to_merge_names[k].append(v)
+                models_dict_to_merge.append(min_model)
+                inner_products.append(min_inner_product)
+
+                log.info(f"Task: {task}, Inner Products: {log_dict}")
                 if len(models_dict_to_merge) >= len(self.modelpool.model_names) or len(models_dict_to_merge) >= self.max_num_models:
                     log.info(f"Breaking at {len(models_dict_to_merge)}")
                     break
+
             
             # print iteration information
-            log.info(f"Iteration {step_idx+1}, Task Vector: {model_to_merge_names}, Gradient Norm: {grad_norm:.6f}")
+            log.info(f"Iteration {step_idx+1}, Task Vector: {model_to_merge_names}, Gradient Norm: {grad_norm:.6f}, Inner Products: {inner_products}")
             
             if self.merge_fn == 'adamerging':
                 models_to_merge = [modelpool.load_model('_pretrained_') for _ in range(len(models_dict_to_merge))]

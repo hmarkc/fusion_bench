@@ -1,4 +1,4 @@
-_target_: fusion_bench.method.FrankWolfeAdamergingAlgorithm
+_target_: fusion_bench.method.FrankWolfeSoftAlgorithm
 init_weight:
 max_iters: 10
 tasks:

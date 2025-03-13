@@ -1,2 +1,2 @@
-from .fw_merging import FrankWolfeAlgorithm
-from .fw_adamerging import FrankWolfeAdamergingAlgorithm
+from .fw_hard import FrankWolfeAlgorithm
+from .fw_soft import FrankWolfeSoftAlgorithm

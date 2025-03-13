@@ -8,3 +8,4 @@ init_weight:
 loss_fn: cross_entropy
 scaling_factor: 0.3
 max_num_models: 100
+granularity: task
